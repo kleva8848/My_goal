@@ -11,6 +11,7 @@
 - `docs/client-acquisition/brainstorm.md`: усі ідеї з брейншторму (канали, сигнали, оффери, контент).
 - `docs/client-acquisition/lead-engine-vacancies.md`: детальний план головної ідеї «Вакансії як сигнал».
 - `docs/client-acquisition/lead-engine-maps-sites.md`: план «Google Maps → готовий демо-сайт».
+- `docs/client-acquisition/f0-checklist.md`: що потрібно від Влада для старту (рішення + ключі).
 - `docs/client-acquisition/backlog.md`: що робимо по черзі, статуси.
 
 ## Як продовжувати
