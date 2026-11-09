@@ -7,6 +7,7 @@
 - **Ціль:** 1–2 нових клієнти на місяць через максимально автоматизовану систему пошуку.
 
 ## Де що лежить
+- `docs/client-acquisition/system-plan.md`: **майстер-план** (модулі M1–M9, фази F0–F6). Починати звідси.
 - `docs/client-acquisition/brainstorm.md`: усі ідеї з брейншторму (канали, сигнали, оффери, контент).
 - `docs/client-acquisition/lead-engine-vacancies.md`: детальний план головної ідеї «Вакансії як сигнал».
 - `docs/client-acquisition/lead-engine-maps-sites.md`: план «Google Maps → готовий демо-сайт».
