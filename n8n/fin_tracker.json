@@ -1,0 +1,357 @@
+{
+  "name": "[Fin] Трекер",
+  "nodes": [
+    {
+      "id": "telegram-trigger",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "updates": [
+          "message"
+        ],
+        "additionalFields": {}
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "SET_ME",
+          "name": "Fin Tracker Bot"
+        }
+      },
+      "webhookId": "fin-tracker-tg-trigger"
+    },
+    {
+      "id": "code-prepare-message",
+      "name": "Code - Prepare Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// лише текстові повідомлення; все інше (стікери, фото) ігноруємо\nconst m = $json.message || $json.channel_post;\nif (!m || typeof m.text !== 'string') return [];\nreturn [{ json: { kind: 'msg', chat_id: m.chat.id, message_id: m.message_id, reply_to: m.reply_to_message ? m.reply_to_message.message_id : null, text: m.text } }];"
+      }
+    },
+    {
+      "id": "schedule-weekly-sun-19-00",
+      "name": "Schedule - Weekly Sun 19:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        660,
+        220
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 19 * * 0"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "schedule-plan-27th-10-00",
+      "name": "Schedule - Plan 27th 10:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        880,
+        380
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 10 27 * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "schedule-month-1st-09-00",
+      "name": "Schedule - Month 1st 09:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        1100,
+        540
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 1 * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "code-schedule-kind",
+      "name": "Code - Schedule Kind",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        380
+      ],
+      "parameters": {
+        "jsCode": "const kind = $('Schedule - Weekly Sun 19:00').isExecuted ? 'weekly'\n  : $('Schedule - Plan 27th 10:00').isExecuted ? 'plan' : 'month';\nreturn [{ json: { kind } }];"
+      }
+    },
+    {
+      "id": "supabase-inbox",
+      "name": "Supabase - Inbox",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        1540,
+        0
+      ],
+      "parameters": {
+        "operation": "create",
+        "tableId": "fin_inbox",
+        "dataToSend": "autoMapInputData"
+      },
+      "credentials": {
+        "supabaseApi": {
+          "id": "SET_ME",
+          "name": "Fin Supabase"
+        }
+      }
+    },
+    {
+      "id": "if-reaction-",
+      "name": "IF - Reaction?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1760,
+        -120
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "r",
+              "leftValue": "={{ !!$json.reaction }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "http-set-reaction",
+      "name": "HTTP - Set Reaction",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1980,
+        -120
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env.FIN_TG_TOKEN }}/setMessageReaction",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ chat_id: $json.chat_id, message_id: $json.message_id, reaction: [{ type: \"emoji\", emoji: $json.reaction }] }) }}",
+        "options": {}
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "if-reply-",
+      "name": "IF - Reply?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2200,
+        120
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "t",
+              "leftValue": "={{ !!$json.reply }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "telegram-send-reply",
+      "name": "Telegram - Send Reply",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2420,
+        120
+      ],
+      "parameters": {
+        "chatId": "={{ $json.chat_id }}",
+        "text": "={{ $json.reply.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "SET_ME",
+          "name": "Fin Tracker Bot"
+        }
+      },
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "Code - Prepare Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Prepare Message": {
+      "main": [
+        [
+          {
+            "node": "Supabase - Inbox",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule - Weekly Sun 19:00": {
+      "main": [
+        [
+          {
+            "node": "Code - Schedule Kind",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule - Plan 27th 10:00": {
+      "main": [
+        [
+          {
+            "node": "Code - Schedule Kind",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule - Month 1st 09:00": {
+      "main": [
+        [
+          {
+            "node": "Code - Schedule Kind",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Schedule Kind": {
+      "main": [
+        [
+          {
+            "node": "Supabase - Inbox",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supabase - Inbox": {
+      "main": [
+        [
+          {
+            "node": "IF - Reaction?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "IF - Reply?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Reaction?": {
+      "main": [
+        [
+          {
+            "node": "HTTP - Set Reaction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Reply?": {
+      "main": [
+        [
+          {
+            "node": "Telegram - Send Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/Kyiv"
+  }
+}
