@@ -12,13 +12,14 @@
       ],
       "parameters": {
         "updates": [
-          "message"
+          "message",
+          "callback_query"
         ],
         "additionalFields": {}
       },
       "credentials": {
         "telegramApi": {
-          "id": "SET_ME",
+          "id": "r7xsenDeYKdTL5xM",
           "name": "Fin Tracker Bot"
         }
       },
@@ -34,7 +35,7 @@
         0
       ],
       "parameters": {
-        "jsCode": "// лише текстові повідомлення; все інше (стікери, фото) ігноруємо\nconst m = $json.message || $json.channel_post;\nif (!m || typeof m.text !== 'string') return [];\nreturn [{ json: { kind: 'msg', chat_id: m.chat.id, message_id: m.message_id, reply_to: m.reply_to_message ? m.reply_to_message.message_id : null, text: m.text } }];"
+        "jsCode": "// натискання inline-кнопки → kind 'cb' (text = callback_data, message_id = повідомлення бота)\nconst cq = $json.callback_query;\nif (cq) {\n  if (!cq.message || typeof cq.data !== 'string') return [];\n  return [{ json: { kind: 'cb', chat_id: cq.message.chat.id, message_id: cq.message.message_id, text: cq.data, cb_id: String(cq.id) } }];\n}\n// лише текстові повідомлення; все інше (стікери, фото) ігноруємо\nconst m = $json.message || $json.channel_post;\nif (!m || typeof m.text !== 'string') return [];\nreturn [{ json: { kind: 'msg', chat_id: m.chat.id, message_id: m.message_id, reply_to: m.reply_to_message ? m.reply_to_message.message_id : null, text: m.text } }];"
       }
     },
     {
@@ -126,7 +127,7 @@
       },
       "credentials": {
         "supabaseApi": {
-          "id": "SET_ME",
+          "id": "gtoBhFv8686EmI4f",
           "name": "Fin Supabase"
         }
       }
@@ -205,7 +206,7 @@
           "conditions": [
             {
               "id": "t",
-              "leftValue": "={{ !!$json.reply }}",
+              "leftValue": "={{ !!$json.reply && !$json.keyboard && $json.kind !== 'cb' }}",
               "rightValue": true,
               "operator": {
                 "type": "boolean",
@@ -237,9 +238,134 @@
       },
       "credentials": {
         "telegramApi": {
-          "id": "SET_ME",
+          "id": "r7xsenDeYKdTL5xM",
           "name": "Fin Tracker Bot"
         }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "if-buttons-",
+      "name": "IF - Buttons?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2640,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "k",
+              "leftValue": "={{ !!$json.reply && !!$json.keyboard && $json.kind !== 'cb' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "http-send-with-buttons",
+      "name": "HTTP - Send With Buttons",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2860,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env.FIN_TG_TOKEN }}/sendMessage",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ chat_id: $json.chat_id, text: $json.reply, reply_markup: $json.keyboard }) }}",
+        "options": {}
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "if-button-pressed-",
+      "name": "IF - Button Pressed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3080,
+        480
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "c",
+              "leftValue": "={{ $json.kind === 'cb' && !!$json.cb_id }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "http-answer-button",
+      "name": "HTTP - Answer Button",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3300,
+        420
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env.FIN_TG_TOKEN }}/answerCallbackQuery",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ callback_query_id: $json.cb_id, text: $json.reply ? '✅ Готово' : 'Ок, лишив як є. Пізніше: «вирівняй»' }) }}",
+        "options": {}
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "http-update-button-message",
+      "name": "HTTP - Update Button Message",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3520,
+        540
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env.FIN_TG_TOKEN }}/{{ $json.reply ? 'editMessageText' : 'editMessageReplyMarkup' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify(Object.assign({ chat_id: $json.chat_id, message_id: $json.message_id, reply_markup: { inline_keyboard: [] } }, $json.reply ? { text: $json.reply } : {})) }}",
+        "options": {}
       },
       "onError": "continueRegularOutput"
     }
@@ -323,6 +449,16 @@
             "node": "IF - Reply?",
             "type": "main",
             "index": 0
+          },
+          {
+            "node": "IF - Buttons?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "IF - Button Pressed?",
+            "type": "main",
+            "index": 0
           }
         ]
       ]
@@ -343,6 +479,33 @@
         [
           {
             "node": "Telegram - Send Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Buttons?": {
+      "main": [
+        [
+          {
+            "node": "HTTP - Send With Buttons",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Button Pressed?": {
+      "main": [
+        [
+          {
+            "node": "HTTP - Answer Button",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "HTTP - Update Button Message",
             "type": "main",
             "index": 0
           }

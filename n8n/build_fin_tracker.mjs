@@ -27,7 +27,13 @@ const ifTrue = (id, left) => ({
   options: {},
 })
 
-const prepare = `// лише текстові повідомлення; все інше (стікери, фото) ігноруємо
+const prepare = `// натискання inline-кнопки → kind 'cb' (text = callback_data, message_id = повідомлення бота)
+const cq = $json.callback_query;
+if (cq) {
+  if (!cq.message || typeof cq.data !== 'string') return [];
+  return [{ json: { kind: 'cb', chat_id: cq.message.chat.id, message_id: cq.message.message_id, text: cq.data, cb_id: String(cq.id) } }];
+}
+// лише текстові повідомлення; все інше (стікери, фото) ігноруємо
 const m = $json.message || $json.channel_post;
 if (!m || typeof m.text !== 'string') return [];
 return [{ json: { kind: 'msg', chat_id: m.chat.id, message_id: m.message_id, reply_to: m.reply_to_message ? m.reply_to_message.message_id : null, text: m.text } }];`
@@ -37,7 +43,7 @@ const kind = `const kind = $('Schedule - Weekly Sun 19:00').isExecuted ? 'weekly
 return [{ json: { kind } }];`
 
 const nodes = [
-  node('Telegram Trigger', 'n8n-nodes-base.telegramTrigger', 1.1, { updates: ['message'], additionalFields: {} },
+  node('Telegram Trigger', 'n8n-nodes-base.telegramTrigger', 1.1, { updates: ['message', 'callback_query'], additionalFields: {} },
     { ...tg, webhookId: 'fin-tracker-tg-trigger' }),
   node('Code - Prepare Message', 'n8n-nodes-base.code', 2, { jsCode: prepare }),
   node('Schedule - Weekly Sun 19:00', 'n8n-nodes-base.scheduleTrigger', 1.2, { rule: { interval: [{ field: 'cronExpression', expression: '0 19 * * 0' }] } }, { y: 220 }),
@@ -55,12 +61,37 @@ const nodes = [
     jsonBody: '={{ JSON.stringify({ chat_id: $json.chat_id, message_id: $json.message_id, reaction: [{ type: "emoji", emoji: $json.reaction }] }) }}',
     options: {},
   }, { onError: 'continueRegularOutput', y: -120 }),
-  node('IF - Reply?', 'n8n-nodes-base.if', 2.2, ifTrue('t', '={{ !!$json.reply }}'), { y: 120 }),
+  node('IF - Reply?', 'n8n-nodes-base.if', 2.2, ifTrue('t', "={{ !!$json.reply && !$json.keyboard && $json.kind !== 'cb' }}"), { y: 120 }),
   node('Telegram - Send Reply', 'n8n-nodes-base.telegram', 1.2, {
     chatId: '={{ $json.chat_id }}',
     text: "={{ $json.reply.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') }}",
     additionalFields: { appendAttribution: false, parse_mode: 'HTML' },
   }, { ...tg, onError: 'continueRegularOutput', y: 120 }),
+  // відповідь з inline-кнопками (Telegram-вузол не вміє динамічну клавіатуру) → Bot API напряму
+  node('IF - Buttons?', 'n8n-nodes-base.if', 2.2, ifTrue('k', "={{ !!$json.reply && !!$json.keyboard && $json.kind !== 'cb' }}"), { y: 300 }),
+  node('HTTP - Send With Buttons', 'n8n-nodes-base.httpRequest', 4.2, {
+    method: 'POST',
+    url: '=https://api.telegram.org/bot{{ $env.FIN_TG_TOKEN }}/sendMessage',
+    sendBody: true, specifyBody: 'json',
+    jsonBody: '={{ JSON.stringify({ chat_id: $json.chat_id, text: $json.reply, reply_markup: $json.keyboard }) }}',
+    options: {},
+  }, { onError: 'continueRegularOutput', y: 300 }),
+  // натиснули кнопку: зняти «годинник» з кнопки + замінити повідомлення бота на результат (або лише прибрати кнопки)
+  node('IF - Button Pressed?', 'n8n-nodes-base.if', 2.2, ifTrue('c', "={{ $json.kind === 'cb' && !!$json.cb_id }}"), { y: 480 }),
+  node('HTTP - Answer Button', 'n8n-nodes-base.httpRequest', 4.2, {
+    method: 'POST',
+    url: '=https://api.telegram.org/bot{{ $env.FIN_TG_TOKEN }}/answerCallbackQuery',
+    sendBody: true, specifyBody: 'json',
+    jsonBody: "={{ JSON.stringify({ callback_query_id: $json.cb_id, text: $json.reply ? '✅ Готово' : 'Ок, лишив як є. Пізніше: «вирівняй»' }) }}",
+    options: {},
+  }, { onError: 'continueRegularOutput', y: 420 }),
+  node('HTTP - Update Button Message', 'n8n-nodes-base.httpRequest', 4.2, {
+    method: 'POST',
+    url: "=https://api.telegram.org/bot{{ $env.FIN_TG_TOKEN }}/{{ $json.reply ? 'editMessageText' : 'editMessageReplyMarkup' }}",
+    sendBody: true, specifyBody: 'json',
+    jsonBody: '={{ JSON.stringify(Object.assign({ chat_id: $json.chat_id, message_id: $json.message_id, reply_markup: { inline_keyboard: [] } }, $json.reply ? { text: $json.reply } : {})) }}',
+    options: {},
+  }, { onError: 'continueRegularOutput', y: 540 }),
 ]
 
 const to = (...ns) => ({ main: [ns.map(n => ({ node: n, type: 'main', index: 0 }))] })
@@ -71,9 +102,11 @@ const connections = {
   'Schedule - Plan 27th 10:00': to('Code - Schedule Kind'),
   'Schedule - Month 1st 09:00': to('Code - Schedule Kind'),
   'Code - Schedule Kind': to('Supabase - Inbox'),
-  'Supabase - Inbox': to('IF - Reaction?', 'IF - Reply?'),
+  'Supabase - Inbox': to('IF - Reaction?', 'IF - Reply?', 'IF - Buttons?', 'IF - Button Pressed?'),
   'IF - Reaction?': to('HTTP - Set Reaction'),
   'IF - Reply?': to('Telegram - Send Reply'),
+  'IF - Buttons?': to('HTTP - Send With Buttons'),
+  'IF - Button Pressed?': to('HTTP - Answer Button', 'HTTP - Update Button Message'),
 }
 const wf = { name: '[Fin] Трекер', nodes, connections, settings: { executionOrder: 'v1', timezone: 'Europe/Kyiv' } }
 writeFileSync(join(here, 'fin_tracker.json'), JSON.stringify(wf, null, 2))

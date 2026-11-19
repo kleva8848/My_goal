@@ -93,6 +93,8 @@ create table if not exists fin_inbox (
   reaction text,
   reply text
 );
+alter table fin_inbox add column if not exists keyboard jsonb;   -- inline-кнопки до reply (reply_markup)
+alter table fin_inbox add column if not exists cb_id text;       -- id натискання кнопки (callback_query)
 
 alter table fin_settings enable row level security;
 alter table fin_categories enable row level security;
@@ -244,7 +246,9 @@ begin
     || case when (f->>'goal_res')::numeric > 0 then ', цілі ' || fin_m((f->>'goal_res')::numeric) else '' end
     || case when (f->>'debt_res')::numeric > 0 then E'\n🏦 Відкласти з дод. доходу на борги: ' || fin_m((f->>'debt_res')::numeric) else '' end
     || case when (f->>'free')::numeric >= 0 then E'\n✅ Вільно до кінця місяця: ' || fin_m((f->>'free')::numeric)
-            else E'\n🚨 План у мінусі: ' || fin_m((f->>'free')::numeric) || ' — треба урізати витрати' end;
+            else E'\n🚨 План у мінусі: ' || fin_m((f->>'free')::numeric) || ' — треба урізати витрати' end
+    || case when exists (select 1 from fin_categories c where fin_limit(c.id, fin_month()) + fin_sum(fin_month(), 'expense', c.id) < 0)
+            then E'\n👉 Є категорії понад ліміт — напиши «вирівняй», покриємо з іншої' else '' end;
 end $$;
 
 create or replace function fin_weekly_text() returns text language plpgsql stable as $$
@@ -288,31 +292,91 @@ create or replace function fin_plan_text(m date) returns text language sql stabl
        + coalesce((select sum(fin_goal_contrib(g, m)) from fin_goals g where done_at is null), 0))
 $$;
 
+-- бюджет місяця: план / факт по категоріях, окремо обов'язкові (fixed + борги) і гнучкі, скільки можна на день
+create or replace function fin_bline(nm text, p numeric, f numeric) returns text language sql immutable as $$
+  select '• ' || nm || ': ' || fin_m(f) || ' / ' || fin_m(p)
+    || case when f > p then ' 🔴 +' || fin_m(f - p) when p > 0 and f = p then ' ✅' else ' · ще ' || fin_m(p - f) end
+$$;
+
+create or replace function fin_budget_text() returns text language plpgsql stable as $$
+declare
+  m date := fin_month();
+  days int := greatest((m + interval '1 month')::date - fin_now()::date, 1);   -- з сьогоднішнім включно
+  fc jsonb := fin_forecast();
+  fix_lines text; flex_lines text; debt_lines text;
+  fix_p numeric; fix_f numeric; fix_l numeric; flex_p numeric; flex_f numeric; flex_l numeric;
+  d_p numeric; d_f numeric; d_l numeric; real_l numeric;
+begin
+  select string_agg(fin_bline(name, p, f), E'\n' order by p desc) filter (where fixed),
+         string_agg(fin_bline(name, p, f), E'\n' order by p desc) filter (where not fixed),
+         coalesce(sum(p) filter (where fixed), 0), coalesce(sum(f) filter (where fixed), 0), coalesce(sum(greatest(p - f, 0)) filter (where fixed), 0),
+         coalesce(sum(p) filter (where not fixed), 0), coalesce(sum(f) filter (where not fixed), 0), coalesce(sum(greatest(p - f, 0)) filter (where not fixed), 0)
+    into fix_lines, flex_lines, fix_p, fix_f, fix_l, flex_p, flex_f, flex_l
+    from (select name, fixed, fin_limit(id, m) p, -fin_sum(m, 'expense', id) f from fin_categories) c
+   where p > 0 or f > 0;
+
+  select string_agg(fin_bline('💳 ' || name, p, f), E'\n' order by p desc),
+         coalesce(sum(p), 0), coalesce(sum(f), 0), coalesce(sum(greatest(p - f, 0)), 0)
+    into debt_lines, d_p, d_f, d_l
+    from (select d.name, fin_debt_planned(d, m) p, -fin_sum(m, 'debt', null, d.id) f
+            from fin_debts d where d.closed_at is null or fin_local(d.closed_at) >= m) x
+   where p > 0 or f > 0;
+
+  fix_lines := concat_ws(E'\n', fix_lines, debt_lines);
+  fix_p := fix_p + d_p; fix_f := fix_f + d_f; fix_l := fix_l + d_l;
+
+  return '📊 Бюджет · ' || fin_mname(m) || E' (факт / план)\n'
+    || E'\n📌 Обов''язкові\n' || coalesce(nullif(fix_lines, ''), '—')
+    || E'\nРазом: ' || fin_m(fix_f) || ' / ' || fin_m(fix_p) || ' · ще ' || fin_m(fix_l)
+    || E'\n\n🛒 Гнучкі\n' || coalesce(flex_lines, '—')
+    || E'\nРазом: ' || fin_m(flex_f) || ' / ' || fin_m(flex_p) || ' · ще ' || fin_m(flex_l)
+    || E'\n\n📅 До кінця місяця: ' || days || ' дн. (з сьогодні)'
+    || E'\n👉 На гнучкі: ' || fin_m(flex_l) || ' ÷ ' || days || ' = ' || fin_m(floor(flex_l / days)) || ' на день'
+    || case when fc->>'cash' is null then E'\n\n💵 Залишок не внесено — напиши: залишок 12000'
+       else E'\n\n💵 Гроші зараз: ' || fin_m((fc->>'cash')::numeric)
+         || case when (fc->>'free')::numeric >= 0 then E'\n✅ Поза планом вільно: ' || fin_m((fc->>'free')::numeric)
+            else E'\n⚠️ Грошей менше, ніж треба за планом, на ' || fin_m(-(fc->>'free')::numeric)
+              || E'\nРеально на гнучкі: ' || fin_m(greatest(flex_l + (fc->>'free')::numeric, 0)) || ' → '
+              || fin_m(floor(greatest(flex_l + (fc->>'free')::numeric, 0) / days)) || ' на день' end end;
+end $$;
+
 create or replace function fin_help_text() returns text language sql immutable as $$ select
 '🧾 Фін трекер — шпаргалка
 
-Щодня:
--390 ютуб — витрата (👍 = записано, 👌 = пішло в «інше»)
-+5000 зп — дохід
--3000 тас — платіж по боргу (якщо «тас» — назва/аліас боргу)
--2к сільпо — можна з «к»
-відміна — видалити останній запис (або відповіддю на повідомлення)
+🚀 Старт (один раз)
+1️⃣ Категорії: категорія їжа 8000 сільпо атб
+2️⃣ Сьогоднішні витрати: -390 ютуб
+3️⃣ Залишок останнім: залишок 12000
 
-Один раз / раз на місяць:
-залишок 12000 — фактичні гроші зараз (з цього все рахується)
-дохід 40000 — орієнтовний дохід на місяць
-категорія їжа 8000 сільпо атб обід — ліміт + слова, по яких ловити витрати
-категорія комуналка 3000 ! — «!» = обов''язкова, не радити урізати
-борг тас 25000 3000 таскомбанк — залишок боргу, платіж/міс, аліаси
-ціль резина 8000 01.11.2027 — обов''язкова витрата, відкладаю щомісяця
+✍️ Щодня
+➖ -390 ютуб — витрата
+➕ +5000 зп — дохід
+💳 -3000 тас — платіж по боргу
+🔢 -2к сільпо — можна з «к»
+↩️ відміна — прибрати останній запис (або відповіддю на потрібне повідомлення)
 
-Питання:
-можу 5000 — чи потягну зараз без нового доходу і що урізати
-стан — скільки грошей і скільки вільно
-звіт — звірка як щотижня
-план — план місяця
+👀 Реакції
+👍 записано в категорію
+👌 записано в «інше»
+🔥 дохід
 
-Після 25-го «дохід/категорія» пишуться в план наступного місяця.' $$;
+⚙️ Налаштування
+💵 залишок 12000 — скільки грошей зараз (від цього все рахується)
+📈 дохід 40000 — план доходу на місяць
+🗂 категорія їжа 8000 сільпо атб обід — ліміт + слова-підказки
+📌 категорія комуналка 3000 ! — «!» = обов''язкова, не радити урізати
+🏦 борг тас 25000 3000 таскомбанк — залишок боргу, платіж/міс, назви
+🎯 ціль резина 8000 01.11.2027 — відкладаю щомісяця
+
+❓ Питання
+📊 бюджет — план / факт, обов''язкові окремо, скільки можна на день
+💰 стан — скільки грошей і скільки вільно
+🤔 можу 5000 — чи потягну і що урізати
+⚖️ вирівняй — категорія понад ліміт? обери кнопкою, з якої покрити
+📊 звіт — звірка за тиждень
+🗓 план — план місяця
+
+💡 Після 25-го «дохід» і «категорія» йдуть у план наступного місяця.' $$;
 
 -- ───────────── Дії ─────────────
 create or replace function fin_afford(x numeric) returns text language plpgsql stable as $$
@@ -359,6 +423,66 @@ begin
   return '🟡 Можна, але тільки якщо урізати.' || E'\n' || tips || cashnote;
 end $$;
 
+-- ───────────── Вирівняти перевищення: кнопками обрати категорію, з якої покрити ─────────────
+-- кнопки: гнучкі категорії з залишком (найбільший першим), по 2 в ряд + «Лишити як є»; null = нема з чого покрити
+create or replace function fin_fix_kb(cat int) returns jsonb language sql stable as $$
+  with c as (
+    select id, name, fin_limit(id, fin_month()) + fin_sum(fin_month(), 'expense', id) left_
+    from fin_categories where id <> cat and not fixed
+  ), b as (
+    select (row_number() over (order by left_ desc, id) - 1)::int rn,
+      jsonb_build_object('text', name || ' · ще ' || fin_m(left_), 'callback_data', 'mv:' || cat || ':' || id) btn
+    from c where left_ > 0 order by left_ desc, id limit 6
+  ), r as (
+    select rn / 2 k, jsonb_agg(btn order by rn) row_ from b group by rn / 2
+  )
+  select case when exists (select 1 from b) then jsonb_build_object('inline_keyboard',
+    (select jsonb_agg(row_ order by k) from r)
+    || jsonb_build_array(jsonb_build_array(jsonb_build_object('text', 'Лишити як є', 'callback_data', 'mv:no')))) end
+$$;
+
+-- «вирівняй»: найбільше перевищення цього місяця + кнопки
+create or replace function fin_fix_offer(out reply text, out keyboard jsonb) language plpgsql stable as $$
+declare m date := fin_month(); r record; others text;
+begin
+  select id, name, -(fin_limit(id, m) + fin_sum(m, 'expense', id)) over_ into r
+    from fin_categories where fin_limit(id, m) + fin_sum(m, 'expense', id) < 0 order by 3 desc limit 1;
+  if r.id is null then reply := E'✅ Усі категорії в межах ліміту.\n\n' || fin_status_text(); return; end if;
+  keyboard := fin_fix_kb(r.id);
+  select string_agg('«' || name || '» ' || fin_m(-(fin_limit(id, m) + fin_sum(m, 'expense', id))), ', ') into others
+    from fin_categories where id <> r.id and fin_limit(id, m) + fin_sum(m, 'expense', id) < 0;
+  reply := '🔴 «' || r.name || '» понад ліміт на ' || fin_m(r.over_)
+    || case when keyboard is null then E'.\nНема гнучких категорій із залишком — покрити нічим 😕'
+            else E'\n👇 З якої категорії покрити ' || fin_m(r.over_) || '?' end
+    || case when others is not null then E'\n\nТакож понад ліміт: ' || others || E' — потім ще раз «вирівняй»' else '' end;
+end $$;
+
+-- натиснули кнопку: ліміт перевищеної категорії += перевищення, ліміт обраної −= стільки ж (лише цей місяць)
+create or replace function fin_cover(over_cat int, src int) returns text language plpgsql as $$
+declare
+  m date := fin_month(); nx date := (fin_month() + interval '1 month')::date;
+  a fin_categories; b fin_categories; amt numeric; b_left numeric;
+begin
+  select * into a from fin_categories where id = over_cat;
+  select * into b from fin_categories where id = src;
+  if a.id is null or b.id is null then return 'Категорію не знайдено 🤷'; end if;
+  amt := -(fin_limit(a.id, m) + fin_sum(m, 'expense', a.id));
+  if amt <= 0 then return '✅ «' || a.name || '» вже в межах ліміту.' || E'\n\n' || fin_status_text(); end if;
+  -- ліміт «діє до наступного запису» → фіксуємо наступний місяць як був, щоб зміна не перейшла далі
+  insert into fin_budgets(month, category_id, amount)
+    values (nx, a.id, fin_limit(a.id, nx)), (nx, b.id, fin_limit(b.id, nx)) on conflict do nothing;
+  insert into fin_budgets(month, category_id, amount)
+    values (m, a.id, fin_limit(a.id, m) + amt), (m, b.id, fin_limit(b.id, m) - amt)
+    on conflict (month, category_id) do update set amount = excluded.amount;
+  delete from fin_alerts where month = m and key in ('over:' || a.id, 'warn:' || a.id);   -- щоб нове перевищення знову попередило
+  b_left := fin_limit(b.id, m) + fin_sum(m, 'expense', b.id);
+  return '⚖️ Покрив ' || fin_m(amt) || ' з «' || b.name || '»'
+    || E'\n✅ «' || a.name || '»: ліміт ' || fin_m(fin_limit(a.id, m)) || ' — в межах'
+    || E'\n➖ «' || b.name || '»: ліміт ' || fin_m(fin_limit(b.id, m)) || ', '
+    || case when b_left >= 0 then 'лишилось ' || fin_m(b_left) else '🔴 понад ліміт на ' || fin_m(-b_left) end
+    || E'\n\n' || fin_status_text();
+end $$;
+
 create or replace function fin_upsert_aliases(old text[], words text[]) returns text[] language sql immutable as
 $$ select case when cardinality(words) > 0 then words else old end $$;
 
@@ -377,8 +501,10 @@ begin
   return '↩️ Видалив: ' || case when t.amount > 0 then '+' else '' end || fin_m(t.amount) || ' ' || coalesce(t.note, '');
 end $$;
 
--- запис руху; повертає (reaction, reply)
-create or replace function fin_record(p_chat bigint, p_msg bigint, p_sign text, p_amount numeric, p_note text, out reaction text, out reply text)
+-- запис руху; повертає (reaction, reply, keyboard)
+drop function if exists fin_record(bigint, bigint, text, numeric, text);   -- стара версія без keyboard
+create or replace function fin_record(p_chat bigint, p_msg bigint, p_sign text, p_amount numeric, p_note text,
+  out reaction text, out reply text, out keyboard jsonb)
 language plpgsql as $$
 declare
   m date := fin_month();
@@ -439,6 +565,7 @@ begin
         if left_ < 0 then
           if fin_alert_once('over:' || c.id) then
             msgs := msgs || ('🔴 «' || c.name || '» перевищено: ' || fin_m(-left_) || ' понад ліміт ' || fin_m(lim));
+            keyboard := fin_fix_kb(c.id);
           end if;
         elsif left_ <= lim * coalesce(fin_set('warn_pct'), '25')::numeric / 100 then
           if fin_alert_once('warn:' || c.id) then
@@ -453,6 +580,9 @@ begin
   if free_after < 0 and coalesce(free_before, 0) >= 0 then
     msgs := msgs || ('🚨 План місяця пішов у мінус: ' || fin_m(free_after) || E'.\nДо кінця місяця треба урізати витрати, інакше знову кредит. Напиши «стан».');
   end if;
+  if keyboard is not null then
+    msgs := msgs || ('👇 З якої категорії покрити ' || fin_m(-left_) || '? Її ліміт зменшиться на цю суму, а «' || c.name || '» стане в межах.');
+  end if;
   if cardinality(msgs) > 0 then reply := array_to_string(msgs, E'\n\n'); end if;
 end $$;
 
@@ -462,6 +592,16 @@ declare
   t text := lower(trim(coalesce(n.text, '')));
   r record; pm date := fin_plan_month(); nums numeric[]; words text[]; nm text; cid int; dt date; f jsonb;
 begin
+  -- натиснули inline-кнопку: text = callback_data, message_id = повідомлення бота (його n8n відредагує на reply)
+  if n.kind = 'cb' then
+    if n.chat_id is null or coalesce(fin_set('owner_chat_id'), '') <> n.chat_id::text then return n; end if;
+    if t ~ '^mv:\d+:\d+$' then
+      nums := regexp_match(t, '^mv:(\d+):(\d+)$')::numeric[];
+      n.reply := fin_cover(nums[1]::int, nums[2]::int);
+    end if;   -- mv:no → reply null: n8n лише прибере кнопки
+    return n;
+  end if;
+
   -- розклад: шлемо власнику
   if n.kind <> 'msg' then
     if coalesce(fin_set('owner_chat_id'), '') = '' then return n; end if;
@@ -498,7 +638,7 @@ begin
       into r from regexp_match(t, '^([+-]?)\s*(\d+(?: \d{3})*(?:[.,]\d+)?)\s*(?:(к|k|тис)(?=\s|$))?(?:\s+(.*))?$') m;
     if r is null or r.a is null or r.a <= 0 then n.reply := 'Не зрозумів суму. Приклад: -390 ютуб'; return n; end if;
     select * into r from fin_record(n.chat_id, n.message_id, case when r.s = '+' then '+' else '-' end, r.a, nullif(r.note, ''));
-    n.reaction := r.reaction; n.reply := r.reply;
+    n.reaction := r.reaction; n.reply := r.reply; n.keyboard := r.keyboard;
     return n;
   end if;
 
@@ -564,11 +704,16 @@ begin
       into n.reply from fin_goals g where name = nm;
   elsif words[1] in ('відміна', 'скасуй', 'видали', 'undo') then
     n.reply := fin_undo(n.chat_id, n.reply_to);
-  elsif words[1] in ('стан', 'баланс', 'скільки') then
+  elsif words[1] in ('вирівняй', 'вирівняти', 'вирівнять', 'fix') then
+    select * into r from fin_fix_offer();
+    n.reply := r.reply; n.keyboard := r.keyboard;
+  elsif words[1] in ('бюджет', 'budget') then
+    n.reply := fin_budget_text();
+  elsif words[1] in ('стан', 'баланс', 'скільки', 'status') then
     n.reply := fin_status_text();
-  elsif words[1] in ('звіт', 'звірка') then
+  elsif words[1] in ('звіт', 'звірка', 'report') then
     n.reply := fin_weekly_text();
-  elsif words[1] = 'план' then
+  elsif words[1] in ('план', 'plan') then
     n.reply := fin_plan_text(pm);
   elsif (words[1] in ('можу', 'чи') or t ~ '\?') and nums is not null then
     n.reply := fin_afford(nums[1]);
