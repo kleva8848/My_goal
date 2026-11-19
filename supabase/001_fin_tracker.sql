@@ -74,6 +74,7 @@ create table if not exists fin_tx (
   message_id bigint,
   unique (chat_id, message_id)
 );
+alter table fin_tx add column if not exists period date;   -- місяць, якому належить дохід (якщо не за датою запису)
 create index if not exists fin_tx_at on fin_tx(at);
 
 create table if not exists fin_alerts (        -- щоб не спамити одним і тим самим попередженням
@@ -144,7 +145,7 @@ $$;
 -- сума руху за місяць (за київським часом)
 create or replace function fin_sum(m date, k text, cat int default null, debt int default null) returns numeric language sql stable as $$
   select coalesce(sum(amount), 0) from fin_tx
-  where kind = k and fin_local(at) >= m and fin_local(at) < m + interval '1 month'
+  where kind = k and coalesce(period, date_trunc('month', fin_local(at))::date) = m
     and (cat is null or category_id = cat) and (debt is null or debt_id = debt)
 $$;
 
@@ -176,6 +177,7 @@ declare
   cat_left numeric := 0; debt_left numeric := 0; goal_res numeric := 0;
   planned_pay numeric := 0; paid numeric := -fin_sum(m, 'debt');
   extra numeric; debt_res numeric; free numeric;
+  earm numeric := coalesce((select sum(amount) from fin_tx where kind = 'income' and period > m), 0);   -- дохід, що вже тут, але належить наступним місяцям
   r record;
 begin
   for r in select id from fin_categories loop
@@ -190,8 +192,8 @@ begin
   end loop;
   extra := case when plan > 0 then greatest(inc - plan, 0) else 0 end;
   debt_res := greatest(extra * coalesce(fin_set('debt_share'), '80')::numeric / 100 - greatest(paid - planned_pay, 0), 0);
-  free := cash + greatest(plan - inc, 0) - cat_left - debt_left - goal_res - debt_res;
-  return jsonb_build_object('cash', cash, 'income_left', greatest(plan - inc, 0), 'cat_left', cat_left,
+  free := cash + greatest(plan - inc, 0) - cat_left - debt_left - goal_res - debt_res - earm;
+  return jsonb_build_object('cash', cash, 'earmarked', earm, 'income_left', greatest(plan - inc, 0), 'cat_left', cat_left,
     'debt_left', debt_left, 'goal_res', goal_res, 'debt_res', debt_res, 'free', free);
 end $$;
 
@@ -242,6 +244,7 @@ begin
   if f->>'cash' is null then return '💵 Фактичний залишок ще не внесено — напиши: залишок 12000'; end if;
   return '💵 Гроші зараз: ' || fin_m((f->>'cash')::numeric)
     || case when (f->>'income_left')::numeric > 0 then E'\n➕ Ще очікується дохід: ' || fin_m((f->>'income_left')::numeric) else '' end
+    || case when (f->>'earmarked')::numeric > 0 then E'\n📅 З цих грошей не мої цього місяця (дохід наперед): ' || fin_m((f->>'earmarked')::numeric) else '' end
     || E'\n➖ Ще заплановано: категорії ' || fin_m((f->>'cat_left')::numeric) || ', борги ' || fin_m((f->>'debt_left')::numeric)
     || case when (f->>'goal_res')::numeric > 0 then ', цілі ' || fin_m((f->>'goal_res')::numeric) else '' end
     || case when (f->>'debt_res')::numeric > 0 then E'\n🏦 Відкласти з дод. доходу на борги: ' || fin_m((f->>'debt_res')::numeric) else '' end
@@ -501,6 +504,26 @@ begin
   return '↩️ Видалив: ' || case when t.amount > 0 then '+' else '' end || fin_m(t.amount) || ' ' || coalesce(t.note, '');
 end $$;
 
+-- «грудень»/«грудня»/«груд» у примітці доходу → перше число найближчого такого місяця (не раніше поточного)
+create or replace function fin_month_word(tok text[]) returns date language plpgsql stable as $$
+declare
+  pats text[] := array['^(січ|січня|січень)$', '^(лют|лютого|лютий)$', '^(бер|березня|березень)$', '^(кві|квіт|квітня|квітень)$',
+    '^(тра|трав|травня|травень)$', '^(чер|черв|червня|червень)$', '^(лип|липня|липень)$', '^(сер|серп|серпня|серпень)$',
+    '^(вер|вересня|вересень)$', '^(жов|жовт|жовтня|жовтень)$', '^(лис|листопада|листопад)$', '^(гру|груд|грудня|грудень)$'];
+  i int; t text; cur date := fin_month(); y int := extract(year from cur)::int; d date;
+begin
+  foreach t in array tok loop
+    for i in 1..12 loop
+      if t ~ pats[i] then
+        d := make_date(y, i, 1);
+        if d < cur then d := make_date(y + 1, i, 1); end if;
+        return d;
+      end if;
+    end loop;
+  end loop;
+  return null;
+end $$;
+
 -- запис руху; повертає (reaction, reply, keyboard)
 drop function if exists fin_record(bigint, bigint, text, numeric, text);   -- стара версія без keyboard
 create or replace function fin_record(p_chat bigint, p_msg bigint, p_sign text, p_amount numeric, p_note text,
@@ -511,16 +534,21 @@ declare
   tok text[] := fin_tokens(p_note);
   free_before numeric := (fin_forecast()->>'free')::numeric;
   free_after numeric;
-  d fin_debts; g fin_goals; c fin_categories;
+  d fin_debts; g fin_goals; c fin_categories; im date;
   plan numeric; inc_before numeric; extra numeric; lim numeric; left_ numeric; msgs text[] := '{}';
 begin
   if exists (select 1 from fin_tx where chat_id = p_chat and message_id = p_msg) then reaction := '👍'; return; end if;
 
   if p_sign = '+' then
-    plan := fin_income_plan(m);
-    inc_before := fin_sum(m, 'income');
-    insert into fin_tx(amount, kind, note, chat_id, message_id) values (p_amount, 'income', p_note, p_chat, p_msg);
+    im := coalesce(fin_month_word(tok), m);
+    plan := fin_income_plan(im);
+    inc_before := fin_sum(im, 'income');
+    insert into fin_tx(amount, kind, note, chat_id, message_id, period) values (p_amount, 'income', p_note, p_chat, p_msg, case when im <> m then im end);
     reaction := '🔥';
+    if im <> m then
+      reply := '📅 Дохід ' || fin_m(p_amount) || ' записано на ' || to_char(im, 'MM.YYYY') || ' — у поточний місяць не рахується (гроші вже в «зараз»).';
+      return;
+    end if;
     extra := case when plan > 0 then greatest(inc_before + p_amount - plan, 0) - greatest(inc_before - plan, 0) else 0 end;
     if extra > 0 then
       select * into d from fin_debts where closed_at is null order by balance limit 1;
